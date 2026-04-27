@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="North Texas NTIRN live scanner — Grapevine, Euless, Colleyville, Southlake" />
+  <title>Scanner AI — North Texas NTIRN</title>
+
+  <!-- Fonts: Cabinet Grotesk (display) + Satoshi (body) — tech/data tone -->
+  <link href="https://api.fontshare.com/v2/css?f[]=cabinet-grotesk@700,800&f[]=satoshi@400,500,600&display=swap" rel="stylesheet" />
+
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- HEADER -->
+  <header class="header">
+    <div class="header-inner">
+      <div class="logo-lockup">
+        <!-- SVG Logo: radio wave mark -->
+        <svg class="logo-icon" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+          <circle cx="16" cy="22" r="3" fill="currentColor"/>
+          <path d="M10 16.5C11.5 14.5 13.6 13 16 13s4.5 1.5 6 3.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/>
+          <path d="M5.5 12C8 8.5 11.7 6 16 6s8 2.5 10.5 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none" opacity="0.5"/>
+        </svg>
+        <span class="logo-text">Scanner<span class="logo-accent">AI</span></span>
+      </div>
+
+      <div class="header-right">
+        <div class="status-dot" id="statusDot" title="Connection status"></div>
+        <span class="status-label" id="statusLabel">Connecting...</span>
+        <button class="theme-btn" data-theme-toggle aria-label="Toggle dark mode">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- STATS BAR -->
+  <div class="stats-bar">
+    <div class="stat">
+      <span class="stat-value" id="statTotal">—</span>
+      <span class="stat-label">Calls Today</span>
+    </div>
+    <div class="stat-divider"></div>
+    <div class="stat">
+      <span class="stat-value stat-alert" id="statAlerts">—</span>
+      <span class="stat-label">Alerts</span>
+    </div>
+    <div class="stat-divider"></div>
+    <div class="stat">
+      <span class="stat-value stat-high" id="statHigh">—</span>
+      <span class="stat-label">High Priority</span>
+    </div>
+    <div class="stat-divider"></div>
+    <div class="stat">
+      <span class="stat-value" id="statChannels">16</span>
+      <span class="stat-label">Channels</span>
+    </div>
+  </div>
+
+  <!-- FILTER BAR -->
+  <div class="filter-bar">
+    <button class="filter-btn active" data-filter="all">All Calls</button>
+    <button class="filter-btn" data-filter="priority">⚡ Priority Only</button>
+    <button class="filter-btn" data-filter="fire">🔥 Fire</button>
+    <button class="filter-btn" data-filter="law">🚔 Police</button>
+    <button class="filter-btn" data-filter="alerts">🚨 Alerts</button>
+  </div>
+
+  <!-- MAIN CONTENT -->
+  <main class="main">
+    <!-- LIVE TICKER -->
+    <section class="ticker-section">
+      <div class="section-header">
+        <h2 class="section-title">Live Feed</h2>
+        <div class="live-indicator">
+          <span class="pulse-dot"></span>
+          <span>LIVE</span>
+        </div>
+      </div>
+
+      <!-- Empty state -->
+      <div class="empty-state" id="emptyState">
+        <svg width="48" height="48" viewBox="0 0 32 32" fill="none" opacity="0.3">
+          <circle cx="16" cy="22" r="3" fill="currentColor"/>
+          <path d="M10 16.5C11.5 14.5 13.6 13 16 13s4.5 1.5 6 3.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+          <path d="M5.5 12C8 8.5 11.7 6 16 6s8 2.5 10.5 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" opacity="0.5"/>
+        </svg>
+        <p>Waiting for calls...</p>
+        <p class="empty-sub">Calls over 20 seconds will appear here</p>
+      </div>
+
+      <!-- Call list -->
+      <div class="call-list" id="callList" role="list" aria-label="Live scanner calls"></div>
+    </section>
+
+    <!-- CHANNEL GUIDE SIDEBAR -->
+    <aside class="channel-sidebar">
+      <h3 class="sidebar-title">Channels</h3>
+      <div class="channel-list" id="channelList"></div>
+
+      <div class="keyword-panel">
+        <h3 class="sidebar-title">Alert Keywords</h3>
+        <div class="keyword-group">
+          <span class="kw-badge high">HIGH</span>
+          <div class="kw-list" id="kwHigh"></div>
+        </div>
+        <div class="keyword-group">
+          <span class="kw-badge medium">MED</span>
+          <div class="kw-list" id="kwMedium"></div>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <!-- ALERT TOAST -->
+  <div class="toast-container" id="toastContainer" aria-live="assertive"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

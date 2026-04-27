@@ -1,0 +1,157 @@
+# Scanner AI - config.yaml
+# Railway deployment copy
+# Credentials can also be set as environment variables:
+#   BCFY_USERNAME, BCFY_PASSWORD
+
+credentials:
+  username: "ScottTSU4"
+  password: "mZTD9ReWfX2N3r!"
+
+broadcastify:
+  system_id: 7349
+
+talkgroups:
+  priority:
+    - id: 6324
+      name: "Euless PD Patrol 1"
+      type: "Law Dispatch"
+    - id: 6332
+      name: "Euless Fire Dispatch"
+      type: "Fire Dispatch"
+    - id: 6414
+      name: "NET PD Pat 1 (Combined)"
+      type: "Law Dispatch"
+
+  all:
+    - id: 6270
+      name: "NET Fire 3 Colleyville"
+      type: "Fire-Tac"
+    - id: 6324
+      name: "Euless PD Patrol 1"
+      type: "Law Dispatch"
+    - id: 6325
+      name: "Euless PD Patrol 2"
+      type: "Law Tac"
+    - id: 6326
+      name: "Euless PD Patrol 3"
+      type: "Law Tac"
+    - id: 6327
+      name: "Euless PD Patrol 4"
+      type: "Law Tac"
+    - id: 6332
+      name: "Euless Fire Dispatch"
+      type: "Fire Dispatch"
+    - id: 6333
+      name: "Euless Fire 2"
+      type: "Fire-Tac"
+    - id: 6354
+      name: "Grapevine PD Dispatch"
+      type: "Law Dispatch"
+    - id: 6355
+      name: "Grapevine PD 2"
+      type: "Law Talk"
+    - id: 6365
+      name: "Grapevine Fire Alarm"
+      type: "Fire Dispatch"
+    - id: 6366
+      name: "Grapevine Fire 2"
+      type: "Fire-Tac"
+    - id: 6367
+      name: "Grapevine Fire 3"
+      type: "Fire-Tac"
+    - id: 6414
+      name: "NET PD Pat 1 (Combined)"
+      type: "Law Dispatch"
+    - id: 6415
+      name: "NET TCIC (Combined)"
+      type: "Law Talk"
+    - id: 6417
+      name: "NET Fire Alarm (Combined)"
+      type: "Fire Dispatch"
+    - id: 6418
+      name: "NET Fire 2 Response"
+      type: "Fire-Tac"
+
+filtering:
+  min_duration_seconds: 20
+  poll_interval_seconds: 30
+  lookback_minutes: 5
+
+transcription:
+  model_size: "base"
+  language: "en"
+  initial_prompt: >-
+    North Texas public safety radio dispatch. NTIRN system.
+    Agencies: Grapevine Police, Grapevine Fire, Euless Police, Euless Fire,
+    Colleyville Police, Southlake Police, Keller Police, Westlake Police.
+    Common streets: Ira E Woods Ave, Glade Rd, Euless Main St, Airport Freeway,
+    SH 121, SH 114, DFW Airport, Grapevine Mills, Bass Pro Dr, William D Tate Ave.
+    Common terms: Code 4, Signal 4, en route, on scene, clear, 10-4,
+    structure fire, working fire, MVA, domestic disturbance, welfare check,
+    shots fired, signal 5, BOLO, EMS requested.
+  beam_size: 5
+  no_speech_threshold: 0.75
+  normalization: 95
+  block_phrases:
+    - "CastingWords"
+    - "Rev.com"
+    - "amara.org"
+    - "Thank you for watching"
+    - "Stay tuned"
+    - "We'll be right back"
+    - "Transcription Outsourcing"
+  output_folder: "transcripts/"
+
+alerting:
+  enabled: true
+  min_duration_for_alert: 15
+  high_priority_keywords:
+    - "structure fire"
+    - "working fire"
+    - "shots fired"
+    - "shooting"
+    - "stabbing"
+    - "hostage"
+    - "officer down"
+    - "multiple callers"
+    - "explosion"
+    - "mayday"
+    - "mass casualty"
+  medium_priority_keywords:
+    - "major accident"
+    - "MVA"
+    - "extrication"
+    - "pursuit"
+    - "chase"
+    - "armed"
+    - "weapon"
+    - "signal 5"
+    - "domestic"
+    - "welfare check"
+    - "rollover"
+    - "unconscious"
+    - "cardiac arrest"
+  location_keywords:
+    - "Ira E Woods"
+    - "Glade Road"
+    - "Grapevine Mills"
+    - "DFW Airport"
+    - "Northwest Highway"
+    - "William D Tate"
+    - "Bass Pro"
+    - "Euless Main"
+    - "Airport Freeway"
+    - "121"
+    - "114"
+  notifications:
+    email:
+      enabled: false
+
+openai:
+  api_key: ""
+  model: "gpt-4o-mini"
+  summarize: false
+
+logging:
+  log_file: "scanner_log.jsonl"
+  print_all_calls: true
