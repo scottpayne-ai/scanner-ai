@@ -61,25 +61,53 @@ def broadcastify_login():
     username = config["credentials"]["username"]
     password = config["credentials"]["password"]
     try:
-        resp = bcfy_session.post(
-            "https://www.broadcastify.com/login",
-            data={"username": username, "password": password, "action": "auth", "redirect": "/"},
-            headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/x-www-form-urlencoded"},
+        # Step 1: GET the login page to pick up any CSRF cookies
+        bcfy_session.get(
+            "https://www.broadcastify.com/calls/",
+            headers={"User-Agent": "Mozilla/5.0"},
             timeout=10,
         )
-        if resp.status_code == 200:
+        # Step 2: POST credentials to the Calls login endpoint
+        resp = bcfy_session.post(
+            "https://www.broadcastify.com/calls/login/",
+            data={"username": username, "password": password, "action": "auth", "redirect": "/calls/"},
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer": "https://www.broadcastify.com/calls/",
+            },
+            timeout=10,
+            allow_redirects=True,
+        )
+        # Check we're logged in — session cookie should now be set
+        if resp.status_code == 200 and "login" not in resp.url:
             bcfy_logged_in = True
-            log.info("Broadcastify login OK")
+            log.info("Broadcastify Calls login OK")
+        else:
+            # Fallback: try the main site login
+            resp2 = bcfy_session.post(
+                "https://www.broadcastify.com/login/",
+                data={"username": username, "password": password, "action": "auth", "redirect": "/calls/"},
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                timeout=10,
+                allow_redirects=True,
+            )
+            if resp2.status_code == 200:
+                bcfy_logged_in = True
+                log.info("Broadcastify login OK (fallback)")
     except Exception as e:
         log.warning(f"Broadcastify login error: {e}")
 
 # ── Duration Filter ───────────────────────────────────────────────────────
 def passes_duration(call: dict) -> bool:
-    dur = int(call.get("duration", call.get("len", 0)))
+    dur = float(call.get("duration", call.get("len", 0)))
     return dur >= config["filtering"]["min_duration_seconds"]
 
 def call_uid(call: dict) -> str:
-    raw = f"{call.get('id','')}{call.get('start_time','')}{call.get('ts','')}{call.get('tg','')}"
+    raw = f"{call.get('filename','')}{call.get('ts','')}{call.get('tg','')}"
     return hashlib.md5(raw.encode()).hexdigest()
 
 # ── Keyword Detection ─────────────────────────────────────────────────────
@@ -149,42 +177,89 @@ def transcribe(audio_url: str) -> str:
         return ""
 
 # ── Broadcastify Calls Polling ────────────────────────────────────────────
+# Track per-talkgroup position cursor for live-calls API
+_tg_positions: dict[int, int] = {}
+
 def fetch_calls(tg_id: int) -> list[dict]:
-    """Try multiple Broadcastify Calls API endpoints."""
-    since = int((datetime.utcnow() - timedelta(minutes=config["filtering"]["lookback_minutes"])).timestamp())
-    
-    endpoints = [
-        f"https://www.broadcastify.com/calls/feed?sys=7349&tg={tg_id}&since={since}",
-        f"https://api.broadcastify.com/call-feed/7349/{tg_id}?since={since}",
-    ]
-    
+    """Poll Broadcastify Calls live-calls API for a single talkgroup."""
+    system_id = config["broadcastify"]["system_id"]
+    group = f"{system_id}-{tg_id}"
+    pos = _tg_positions.get(tg_id, 0)
+    do_init = 1 if pos == 0 else 0
+
     headers = {
         "User-Agent": "Mozilla/5.0",
         "Accept": "application/json",
         "X-Requested-With": "XMLHttpRequest",
+        "Referer": f"https://www.broadcastify.com/calls/tg/{system_id}/{tg_id}",
+        "Content-Type": "application/x-www-form-urlencoded",
     }
-    
-    for url in endpoints:
-        try:
-            r = bcfy_session.get(url, headers=headers, timeout=8)
-            if r.status_code == 200:
-                try:
-                    data = r.json()
-                    calls = data.get("calls", data.get("results", []))
-                    if isinstance(calls, list):
-                        for c in calls:
-                            c["tg"] = c.get("tg", tg_id)
-                        return calls
-                except ValueError:
-                    continue
-        except requests.RequestException:
-            continue
+
+    payload = {
+        "groups": group,
+        "pos": pos,
+        "doInit": do_init,
+        "sid": system_id,
+    }
+
+    try:
+        r = bcfy_session.post(
+            "https://www.broadcastify.com/calls/apis/live-calls",
+            data=payload,
+            headers=headers,
+            timeout=10,
+        )
+        log.debug(f"live-calls TG {tg_id} status={r.status_code} pos={pos}")
+        if r.status_code == 200:
+            data = r.json()
+            raw_calls = data.get("calls", [])
+            # Update position cursor if provided
+            new_pos = data.get("pos", data.get("position", None))
+            if new_pos is not None:
+                _tg_positions[tg_id] = int(new_pos)
+            elif raw_calls:
+                # Advance pos to latest timestamp so we don't re-fetch
+                latest = max(int(c.get("attrs", c).get("ts", 0)) for c in raw_calls)
+                if latest:
+                    _tg_positions[tg_id] = latest
+
+            results = []
+            for c in raw_calls:
+                # Calls API nests data under attrs for trunked calls
+                attrs = c.get("attrs", c)
+                call = {
+                    "tg": int(attrs.get("tg", tg_id)),
+                    "ts": attrs.get("ts", 0),
+                    "len": float(attrs.get("len", 0)),
+                    "filename": attrs.get("filename", ""),
+                    "enc": attrs.get("enc", "mp3"),
+                    "hash": attrs.get("hash", ""),
+                    "display": attrs.get("display", ""),
+                    "transcription": attrs.get("transcription", ""),
+                }
+                # Build audio URL
+                h = call["hash"]
+                fn = call["filename"]
+                enc = call["enc"]
+                if h and fn:
+                    call["audio_url"] = f"https://calls.broadcastify.com/{h}/{system_id}/{fn}.{enc}"
+                elif fn:
+                    call["audio_url"] = f"https://calls.broadcastify.com/{system_id}/{fn}.{enc}"
+                else:
+                    call["audio_url"] = ""
+                results.append(call)
+            return results
+        elif r.status_code in (401, 403):
+            log.warning(f"TG {tg_id}: auth error {r.status_code} — re-logging in")
+            broadcastify_login()
+    except Exception as e:
+        log.error(f"fetch_calls TG {tg_id}: {e}")
     return []
 
 # ── Build a call event dict ────────────────────────────────────────────────
 def make_event(call: dict, tg_id: int) -> dict:
     tg_name = TALKGROUP_MAP.get(tg_id, f"TG {tg_id}")
-    duration = int(call.get("duration", call.get("len", 0)))
+    duration = int(float(call.get("duration", call.get("len", 0))))
     audio_url = call.get("audio_url", call.get("url", ""))
     
     transcript = ""
