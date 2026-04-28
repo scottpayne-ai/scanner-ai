@@ -131,3 +131,4 @@ If you want to keep credentials out of the code, set these in Railway dashboard:
 | Procfile | Fallback start command |
 | site/ | Your frontend dashboard files |
 | DEPLOY_TO_RAILWAY.md | This guide |
+[DEPLOY_TO_RAILWAY.md](https://github.com/user-attachments/files/27177655/DEPLOY_TO_RAILWAY.md)
