@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Scanner AI — FastAPI Backend
-Polls Broadcastify Calls API, transcribes, detects keywords.
+Polls Broadcastify Calls API, transcribes via OpenAI, detects keywords.
 Streams live events to the frontend via SSE.
 """
 
@@ -21,9 +21,9 @@ from typing import AsyncGenerator
 import aiohttp
 import requests
 import yaml
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from sse_starlette.sse import EventSourceResponse
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -41,12 +41,16 @@ if os.environ.get("BCFY_USERNAME"):
 if os.environ.get("BCFY_PASSWORD"):
     config["credentials"]["password"] = os.environ["BCFY_PASSWORD"]
 
+# OpenAI API key — from env var or config
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", config.get("openai", {}).get("api_key", ""))
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("scanner_web")
 
 # ── State ─────────────────────────────────────────────────────────────────
 seen_calls: set[str] = set()
 call_log: list[dict] = []          # In-memory ring buffer (last 200 calls)
+call_log_by_id: dict[str, dict] = {}  # Fast lookup by call ID
 MAX_LOG = 200
 active_sse_queues: list[asyncio.Queue] = []
 bcfy_session = requests.Session()
@@ -124,57 +128,79 @@ def detect_keywords(transcript: str) -> tuple[str | None, str | None]:
             return "MEDIUM", f"📍 {kw}"
     return None, None
 
-# ── Transcription ─────────────────────────────────────────────────────────
-_whisper_model = None
+# ── OpenAI Whisper Transcription ──────────────────────────────────────────
+def transcribe_openai(audio_url: str) -> str:
+    """Download audio from Broadcastify and transcribe via OpenAI Whisper API."""
+    if not OPENAI_API_KEY:
+        log.warning("No OpenAI API key — transcription disabled")
+        return "[transcription unavailable]"
 
-def get_whisper():
-    global _whisper_model
-    if _whisper_model is None:
-        try:
-            from faster_whisper import WhisperModel
-            _whisper_model = WhisperModel(
-                config["transcription"]["model_size"],
-                device="cpu",
-                compute_type="int8",
-            )
-            log.info("Whisper loaded")
-        except ImportError:
-            log.warning("faster-whisper not installed — transcription disabled")
-            return None
-    return _whisper_model
-
-def transcribe(audio_url: str) -> str:
     try:
-        model = get_whisper()
-        if model is None:
-            return "[transcription unavailable]"
-        resp = bcfy_session.get(audio_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15, stream=True)
+        # Download audio using authenticated Broadcastify session
+        resp = bcfy_session.get(
+            audio_url,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Referer": "https://www.broadcastify.com/",
+            },
+            timeout=20,
+            stream=True,
+        )
         if resp.status_code != 200:
+            log.warning(f"Audio download failed: {resp.status_code} — {audio_url}")
             return ""
+
         suffix = ".mp3" if "mp3" in audio_url else ".m4a"
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             for chunk in resp.iter_content(8192):
                 tmp.write(chunk)
             tmp_path = tmp.name
 
-        segs, _ = model.transcribe(
-            tmp_path,
-            language="en",
-            initial_prompt=config["transcription"]["initial_prompt"],
-            beam_size=config["transcription"]["beam_size"],
-            no_speech_threshold=config["transcription"]["no_speech_threshold"],
-            vad_filter=True,
-        )
-        text = " ".join(s.text.strip() for s in segs).strip()
+        # Send to OpenAI Whisper API
+        with open(tmp_path, "rb") as audio_file:
+            whisper_resp = requests.post(
+                "https://api.openai.com/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                files={"file": (f"audio{suffix}", audio_file, "audio/mpeg")},
+                data={
+                    "model": "whisper-1",
+                    "language": "en",
+                    "prompt": (
+                        "North Texas public safety radio dispatch. NTIRN system. "
+                        "Agencies: Grapevine Police, Grapevine Fire, Euless Police, Euless Fire, "
+                        "Colleyville Police, Southlake Police, Keller Police. "
+                        "Common terms: Code 4, en route, on scene, clear, 10-4, structure fire, "
+                        "working fire, MVA, domestic disturbance, welfare check, shots fired, EMS requested."
+                    ),
+                },
+                timeout=30,
+            )
+
         os.unlink(tmp_path)
 
-        for phrase in config["transcription"].get("block_phrases", []):
-            if phrase.lower() in text.lower():
-                return ""
-        return text
+        if whisper_resp.status_code == 200:
+            text = whisper_resp.json().get("text", "").strip()
+            # Filter out hallucinated phrases Whisper sometimes produces on silence
+            block_phrases = config.get("transcription", {}).get("block_phrases", [])
+            for phrase in block_phrases:
+                if phrase.lower() in text.lower():
+                    return ""
+            log.info(f"Transcribed: {text[:80]}")
+            return text
+        else:
+            log.warning(f"OpenAI Whisper error {whisper_resp.status_code}: {whisper_resp.text[:200]}")
+            return ""
+
     except Exception as e:
         log.debug(f"Transcribe error: {e}")
         return ""
+
+def transcribe(audio_url: str) -> str:
+    """Transcription entry point — uses OpenAI Whisper API."""
+    if not audio_url:
+        return "[transcription unavailable]"
+    result = transcribe_openai(audio_url)
+    return result if result else "[transcription unavailable]"
 
 # ── Broadcastify Calls Polling ────────────────────────────────────────────
 PLAYLIST_UUID = "74d8c1ad-432c-11f1-bb32-0ef97433b5f9"
@@ -243,98 +269,6 @@ def fetch_all_calls() -> list[dict]:
         log.error(f"fetch_all_calls: {e}")
     return []
 
-def fetch_calls(tg_id: int) -> list[dict]:
-    """Fetch calls by parsing the Broadcastify talkgroup page HTML."""
-    system_id = config["broadcastify"]["system_id"]
-    url = f"https://www.broadcastify.com/calls/tg/{system_id}/{tg_id}"
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Referer": "https://www.broadcastify.com/calls/",
-    }
-
-    try:
-        r = bcfy_session.get(url, headers=headers, timeout=15)
-        log.debug(f"tg page {tg_id} status={r.status_code}")
-
-        if r.status_code == 200 and "login" not in r.url:
-            # Extract the JavaScript window config that contains call data
-            # Broadcastify embeds call data in a JS variable: window.archiveConfig or similar
-            text = r.text
-
-            # Look for embedded JSON call data in script tags
-            # Pattern: var calls = [...] or "calls":[...]
-            results = []
-
-            # Try to find call data embedded in the page JS
-            import re as _re
-            
-            # Pattern 1: archiveConfig JSON block
-            m = _re.search(r'window\.archiveConfig\s*=\s*(\{.*?\});', text, _re.DOTALL)
-            if m:
-                try:
-                    cfg = json.loads(m.group(1))
-                    raw_calls = cfg.get("calls", [])
-                    for c in raw_calls:
-                        results.append(_normalize_call(c, tg_id, system_id))
-                    if results:
-                        log.info(f"TG {tg_id}: found {len(results)} calls via archiveConfig")
-                        return results
-                except Exception:
-                    pass
-
-            # Pattern 2: inline JSON array assigned to a variable
-            for pattern in [
-                r'"calls"\s*:\s*(\[.*?\])',
-                r'var\s+calls\s*=\s*(\[.*?\])',
-                r'calls:\s*(\[.*?\])',
-            ]:
-                m = _re.search(pattern, text, _re.DOTALL)
-                if m:
-                    try:
-                        raw_calls = json.loads(m.group(1))
-                        for c in raw_calls:
-                            results.append(_normalize_call(c, tg_id, system_id))
-                        if results:
-                            log.info(f"TG {tg_id}: found {len(results)} calls via inline JS")
-                            return results
-                    except Exception:
-                        pass
-
-            # Pattern 3: table rows with call data (HTML fallback)
-            rows = _re.findall(
-                r'<tr[^>]*data-filename=["\']([^"\']+)["\'][^>]*data-len=["\']([\d.]+)["\'][^>]*>',
-                text
-            )
-            for filename, length in rows:
-                results.append({
-                    "tg": tg_id,
-                    "ts": 0,
-                    "len": float(length),
-                    "filename": filename,
-                    "enc": "mp3",
-                    "hash": "",
-                    "audio_url": f"https://calls.broadcastify.com/{system_id}/{filename}.mp3",
-                    "transcription": "",
-                })
-            if results:
-                log.info(f"TG {tg_id}: found {len(results)} calls via HTML table")
-            elif "login" in text.lower() or "sign in" in text.lower():
-                log.warning(f"TG {tg_id}: page appears to require login — re-authenticating")
-                broadcastify_login()
-            else:
-                log.debug(f"TG {tg_id}: no calls found in page (may be quiet)")
-            return results
-
-        elif r.status_code in (401, 403) or "login" in r.url:
-            log.warning(f"TG {tg_id}: auth required ({r.status_code}) — re-logging in")
-            broadcastify_login()
-    except Exception as e:
-        log.error(f"fetch_calls TG {tg_id}: {e}")
-    return []
-
 def _normalize_call(c: dict) -> dict:
     """Normalize a raw call from the live-calls API response."""
     attrs = c.get("attrs", c)
@@ -367,18 +301,18 @@ def make_event(call: dict, tg_id: int) -> dict:
     tg_name = TALKGROUP_MAP.get(tg_id, f"TG {tg_id}")
     duration = int(float(call.get("duration", call.get("len", 0))))
     audio_url = call.get("audio_url", call.get("url", ""))
-    
-    transcript = ""
-    if audio_url:
-        transcript = transcribe(audio_url)
+
+    transcript = transcribe(audio_url) if audio_url else "[transcription unavailable]"
 
     priority, keyword = detect_keywords(transcript) if transcript else (None, None)
 
     is_priority_tg = tg_id in PRIORITY_TG_IDS
     tg_type = next((tg["type"] for tg in config["talkgroups"]["all"] if tg["id"] == tg_id), "")
 
+    uid = call_uid(call)
+
     event = {
-        "id": call_uid(call),
+        "id": uid,
         "timestamp": datetime.now().isoformat(),
         "timestamp_display": datetime.now().strftime("%I:%M:%S %p"),
         "tg_id": tg_id,
@@ -389,7 +323,7 @@ def make_event(call: dict, tg_id: int) -> dict:
         "priority": priority,
         "keyword": keyword,
         "is_priority": is_priority_tg,
-        "audio_url": audio_url,
+        "audio_url": audio_url,   # kept for server-side proxy use
     }
     return event
 
@@ -412,10 +346,6 @@ async def polling_loop():
     broadcastify_login()
     log.info("Starting polling loop")
 
-    # Pre-load whisper in background
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, get_whisper)
-
     poll_interval = config["filtering"]["poll_interval_seconds"]
 
     while True:
@@ -434,8 +364,10 @@ async def polling_loop():
                 event = await asyncio.get_event_loop().run_in_executor(None, make_event, call, tg_id)
 
                 call_log.append(event)
+                call_log_by_id[event["id"]] = event
                 if len(call_log) > MAX_LOG:
-                    call_log.pop(0)
+                    removed = call_log.pop(0)
+                    call_log_by_id.pop(removed["id"], None)
 
                 await broadcast(event)
 
@@ -452,8 +384,6 @@ async def polling_loop():
 async def lifespan(app: FastAPI):
     asyncio.create_task(polling_loop())
     yield
-
-# Health check responds immediately even before Whisper loads
 
 app = FastAPI(title="Scanner AI", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -488,6 +418,54 @@ def get_stats():
         "is_polling": True,
         "talkgroup_count": len(config["talkgroups"]["all"]),
     }
+
+@app.get("/api/audio/{call_id}")
+def proxy_audio(call_id: str):
+    """
+    Proxy audio from Broadcastify using the authenticated server session.
+    The browser can't fetch Broadcastify audio directly (403) — this endpoint
+    fetches it server-side with session cookies and streams it to the browser.
+    """
+    event = call_log_by_id.get(call_id)
+    if not event:
+        return JSONResponse({"error": "call not found"}, status_code=404)
+
+    audio_url = event.get("audio_url", "")
+    if not audio_url:
+        return JSONResponse({"error": "no audio url"}, status_code=404)
+
+    try:
+        resp = bcfy_session.get(
+            audio_url,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Referer": "https://www.broadcastify.com/",
+            },
+            timeout=20,
+            stream=True,
+        )
+        if resp.status_code != 200:
+            log.warning(f"Audio proxy fetch failed: {resp.status_code} — {audio_url}")
+            return JSONResponse({"error": f"upstream {resp.status_code}"}, status_code=502)
+
+        content_type = "audio/mp4" if audio_url.endswith(".m4a") else "audio/mpeg"
+
+        def stream_audio():
+            for chunk in resp.iter_content(chunk_size=8192):
+                if chunk:
+                    yield chunk
+
+        return StreamingResponse(
+            stream_audio(),
+            media_type=content_type,
+            headers={
+                "Accept-Ranges": "bytes",
+                "Cache-Control": "no-cache",
+            },
+        )
+    except Exception as e:
+        log.error(f"Audio proxy error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.get("/api/stream")
 async def stream(request: Request):
