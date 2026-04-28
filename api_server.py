@@ -14,9 +14,12 @@ import re
 import tempfile
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import AsyncGenerator
+from zoneinfo import ZoneInfo
+
+CENTRAL = ZoneInfo("America/Chicago")
 
 import aiohttp
 import requests
@@ -313,8 +316,8 @@ def make_event(call: dict, tg_id: int) -> dict:
 
     event = {
         "id": uid,
-        "timestamp": datetime.now().isoformat(),
-        "timestamp_display": datetime.now().strftime("%I:%M:%S %p"),
+        "timestamp": datetime.now(CENTRAL).isoformat(),
+        "timestamp_display": datetime.now(CENTRAL).strftime("%I:%M:%S %p"),
         "tg_id": tg_id,
         "tg_name": tg_name,
         "tg_type": tg_type,
