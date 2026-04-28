@@ -4,6 +4,4 @@ sse-starlette==1.6.5
 aiohttp==3.11.18
 requests==2.32.3
 pyyaml==6.0.2
-faster-whisper==1.1.1
 numpy==2.2.5
-scipy==1.15.3
