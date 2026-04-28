@@ -177,6 +177,68 @@ def transcribe(audio_url: str) -> str:
         return ""
 
 # ── Broadcastify Calls Polling ────────────────────────────────────────────
+PLAYLIST_UUID = "74d8c1ad-432c-11f1-bb32-0ef97433b5f9"
+_playlist_pos: int = 0
+
+def fetch_all_calls() -> list[dict]:
+    """Poll the Mid Cities playlist via live-calls API — one request for all channels."""
+    global _playlist_pos
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "X-Requested-With": "XMLHttpRequest",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "Referer": f"https://www.broadcastify.com/calls/playlists/?uuid={PLAYLIST_UUID}",
+        "Origin": "https://www.broadcastify.com",
+    }
+
+    payload = {
+        "playlist_uuid": PLAYLIST_UUID,
+        "pos": _playlist_pos,
+        "doInit": 1 if _playlist_pos == 0 else 0,
+        "sid": 0,
+        "systemId": 0,
+    }
+
+    try:
+        r = bcfy_session.post(
+            "https://www.broadcastify.com/calls/apis/live-calls",
+            data=payload,
+            headers=headers,
+            timeout=15,
+        )
+        log.info(f"playlist poll status={r.status_code} pos={_playlist_pos}")
+
+        if r.status_code == 200:
+            try:
+                data = r.json()
+            except Exception:
+                log.warning(f"playlist: non-JSON response: {r.text[:300]}")
+                return []
+
+            raw_calls = data.get("calls", [])
+            new_pos = data.get("pos", data.get("lastPos", None))
+            if new_pos is not None:
+                _playlist_pos = int(new_pos)
+            elif raw_calls:
+                latest = max(int(c.get("attrs", c).get("ts", 0)) for c in raw_calls)
+                if latest:
+                    _playlist_pos = latest
+
+            log.info(f"playlist: {len(raw_calls)} calls received, new pos={_playlist_pos}")
+            return [_normalize_call(c) for c in raw_calls]
+
+        elif r.status_code in (401, 403):
+            log.warning(f"playlist: auth error {r.status_code} — re-logging in")
+            broadcastify_login()
+        else:
+            log.warning(f"playlist: unexpected status {r.status_code}: {r.text[:200]}")
+
+    except Exception as e:
+        log.error(f"fetch_all_calls: {e}")
+    return []
+
 def fetch_calls(tg_id: int) -> list[dict]:
     """Fetch calls by parsing the Broadcastify talkgroup page HTML."""
     system_id = config["broadcastify"]["system_id"]
@@ -269,27 +331,31 @@ def fetch_calls(tg_id: int) -> list[dict]:
         log.error(f"fetch_calls TG {tg_id}: {e}")
     return []
 
-def _normalize_call(c: dict, tg_id: int, system_id: int) -> dict:
-    """Normalize a raw call dict from any source into a standard format."""
+def _normalize_call(c: dict) -> dict:
+    """Normalize a raw call from the live-calls API response."""
     attrs = c.get("attrs", c)
-    fn = attrs.get("filename", attrs.get("fn", ""))
+    tg_id = int(attrs.get("tg", attrs.get("call_tg", 0)))
+    system_id = int(attrs.get("sid", attrs.get("systemId", 0)))
+    fn = attrs.get("filename", "")
     h = attrs.get("hash", "")
     enc = attrs.get("enc", "mp3")
-    if h and fn:
-        audio_url = f"https://calls.broadcastify.com/{h}/{system_id}/{fn}.{enc}"
-    elif fn:
+    cdn = "calls-ai-1" if attrs.get("tag") in (97, 98) else "calls"
+    if h and fn and system_id:
+        audio_url = f"https://{cdn}.broadcastify.com/{h}/{system_id}/{fn}.{enc}"
+    elif fn and system_id:
         audio_url = f"https://calls.broadcastify.com/{system_id}/{fn}.{enc}"
     else:
         audio_url = ""
     return {
-        "tg": int(attrs.get("tg", tg_id)),
-        "ts": attrs.get("ts", attrs.get("start_time", 0)),
-        "len": float(attrs.get("len", attrs.get("duration", 0))),
+        "tg": tg_id,
+        "ts": attrs.get("ts", 0),
+        "len": float(attrs.get("len", attrs.get("call_duration", 0))),
         "filename": fn,
         "enc": enc,
         "hash": h,
         "audio_url": audio_url,
-        "transcription": attrs.get("transcription", attrs.get("transcript", "")),
+        "transcription": attrs.get("transcription", ""),
+        "display": attrs.get("display", ""),
     }
 
 # ── Build a call event dict ────────────────────────────────────────────────
@@ -341,48 +407,39 @@ async def broadcast(event: dict):
 async def polling_loop():
     broadcastify_login()
     log.info("Starting polling loop")
-    
+
     # Pre-load whisper in background
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, get_whisper)
-    
-    tg_ids = (
-        [tg["id"] for tg in config["talkgroups"]["priority"]]
-        + [tg["id"] for tg in config["talkgroups"]["all"] if tg["id"] not in {t["id"] for t in config["talkgroups"]["priority"]}]
-    )
-    tg_ids = list(dict.fromkeys(tg_ids))  # dedupe preserve order
 
     poll_interval = config["filtering"]["poll_interval_seconds"]
-    
+
     while True:
-        for tg_id in tg_ids:
-            try:
-                calls = await asyncio.get_event_loop().run_in_executor(None, fetch_calls, tg_id)
-                for call in calls:
-                    uid = call_uid(call)
-                    if uid in seen_calls:
-                        continue
-                    seen_calls.add(uid)
+        try:
+            calls = await asyncio.get_event_loop().run_in_executor(None, fetch_all_calls)
+            for call in calls:
+                uid = call_uid(call)
+                if uid in seen_calls:
+                    continue
+                seen_calls.add(uid)
 
-                    if not passes_duration(call):
-                        continue
+                if not passes_duration(call):
+                    continue
 
-                    # Transcribe + detect in thread pool
-                    event = await asyncio.get_event_loop().run_in_executor(None, make_event, call, tg_id)
-                    
-                    # Append to ring buffer
-                    call_log.append(event)
-                    if len(call_log) > MAX_LOG:
-                        call_log.pop(0)
+                tg_id = call.get("tg", 0)
+                event = await asyncio.get_event_loop().run_in_executor(None, make_event, call, tg_id)
 
-                    # Broadcast to all SSE clients
-                    await broadcast(event)
+                call_log.append(event)
+                if len(call_log) > MAX_LOG:
+                    call_log.pop(0)
 
-                    level = event.get("priority") or "—"
-                    log.info(f"[{level}] {event['tg_name']} | {event['duration']}s | {event['transcript'][:60]}")
+                await broadcast(event)
 
-            except Exception as e:
-                log.error(f"Poll error TG {tg_id}: {e}")
+                level = event.get("priority") or "—"
+                log.info(f"[{level}] {event['tg_name']} | {event['duration']}s | {event['transcript'][:60]}")
+
+        except Exception as e:
+            log.error(f"Poll error: {e}")
 
         await asyncio.sleep(poll_interval)
 
