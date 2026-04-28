@@ -177,84 +177,120 @@ def transcribe(audio_url: str) -> str:
         return ""
 
 # ── Broadcastify Calls Polling ────────────────────────────────────────────
-# Track per-talkgroup position cursor for live-calls API
-_tg_positions: dict[int, int] = {}
-
 def fetch_calls(tg_id: int) -> list[dict]:
-    """Poll Broadcastify Calls live-calls API for a single talkgroup."""
+    """Fetch calls by parsing the Broadcastify talkgroup page HTML."""
     system_id = config["broadcastify"]["system_id"]
-    group = f"{system_id}-{tg_id}"
-    pos = _tg_positions.get(tg_id, 0)
-    do_init = 1 if pos == 0 else 0
+    url = f"https://www.broadcastify.com/calls/tg/{system_id}/{tg_id}"
 
     headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json",
-        "X-Requested-With": "XMLHttpRequest",
-        "Referer": f"https://www.broadcastify.com/calls/tg/{system_id}/{tg_id}",
-        "Content-Type": "application/x-www-form-urlencoded",
-    }
-
-    payload = {
-        "groups": group,
-        "pos": pos,
-        "doInit": do_init,
-        "sid": system_id,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Referer": "https://www.broadcastify.com/calls/",
     }
 
     try:
-        r = bcfy_session.post(
-            "https://www.broadcastify.com/calls/apis/live-calls",
-            data=payload,
-            headers=headers,
-            timeout=10,
-        )
-        log.debug(f"live-calls TG {tg_id} status={r.status_code} pos={pos}")
-        if r.status_code == 200:
-            data = r.json()
-            raw_calls = data.get("calls", [])
-            # Update position cursor if provided
-            new_pos = data.get("pos", data.get("position", None))
-            if new_pos is not None:
-                _tg_positions[tg_id] = int(new_pos)
-            elif raw_calls:
-                # Advance pos to latest timestamp so we don't re-fetch
-                latest = max(int(c.get("attrs", c).get("ts", 0)) for c in raw_calls)
-                if latest:
-                    _tg_positions[tg_id] = latest
+        r = bcfy_session.get(url, headers=headers, timeout=15)
+        log.debug(f"tg page {tg_id} status={r.status_code}")
 
+        if r.status_code == 200 and "login" not in r.url:
+            # Extract the JavaScript window config that contains call data
+            # Broadcastify embeds call data in a JS variable: window.archiveConfig or similar
+            text = r.text
+
+            # Look for embedded JSON call data in script tags
+            # Pattern: var calls = [...] or "calls":[...]
             results = []
-            for c in raw_calls:
-                # Calls API nests data under attrs for trunked calls
-                attrs = c.get("attrs", c)
-                call = {
-                    "tg": int(attrs.get("tg", tg_id)),
-                    "ts": attrs.get("ts", 0),
-                    "len": float(attrs.get("len", 0)),
-                    "filename": attrs.get("filename", ""),
-                    "enc": attrs.get("enc", "mp3"),
-                    "hash": attrs.get("hash", ""),
-                    "display": attrs.get("display", ""),
-                    "transcription": attrs.get("transcription", ""),
-                }
-                # Build audio URL
-                h = call["hash"]
-                fn = call["filename"]
-                enc = call["enc"]
-                if h and fn:
-                    call["audio_url"] = f"https://calls.broadcastify.com/{h}/{system_id}/{fn}.{enc}"
-                elif fn:
-                    call["audio_url"] = f"https://calls.broadcastify.com/{system_id}/{fn}.{enc}"
-                else:
-                    call["audio_url"] = ""
-                results.append(call)
+
+            # Try to find call data embedded in the page JS
+            import re as _re
+            
+            # Pattern 1: archiveConfig JSON block
+            m = _re.search(r'window\.archiveConfig\s*=\s*(\{.*?\});', text, _re.DOTALL)
+            if m:
+                try:
+                    cfg = json.loads(m.group(1))
+                    raw_calls = cfg.get("calls", [])
+                    for c in raw_calls:
+                        results.append(_normalize_call(c, tg_id, system_id))
+                    if results:
+                        log.info(f"TG {tg_id}: found {len(results)} calls via archiveConfig")
+                        return results
+                except Exception:
+                    pass
+
+            # Pattern 2: inline JSON array assigned to a variable
+            for pattern in [
+                r'"calls"\s*:\s*(\[.*?\])',
+                r'var\s+calls\s*=\s*(\[.*?\])',
+                r'calls:\s*(\[.*?\])',
+            ]:
+                m = _re.search(pattern, text, _re.DOTALL)
+                if m:
+                    try:
+                        raw_calls = json.loads(m.group(1))
+                        for c in raw_calls:
+                            results.append(_normalize_call(c, tg_id, system_id))
+                        if results:
+                            log.info(f"TG {tg_id}: found {len(results)} calls via inline JS")
+                            return results
+                    except Exception:
+                        pass
+
+            # Pattern 3: table rows with call data (HTML fallback)
+            rows = _re.findall(
+                r'<tr[^>]*data-filename=["\']([^"\']+)["\'][^>]*data-len=["\']([\d.]+)["\'][^>]*>',
+                text
+            )
+            for filename, length in rows:
+                results.append({
+                    "tg": tg_id,
+                    "ts": 0,
+                    "len": float(length),
+                    "filename": filename,
+                    "enc": "mp3",
+                    "hash": "",
+                    "audio_url": f"https://calls.broadcastify.com/{system_id}/{filename}.mp3",
+                    "transcription": "",
+                })
+            if results:
+                log.info(f"TG {tg_id}: found {len(results)} calls via HTML table")
+            elif "login" in text.lower() or "sign in" in text.lower():
+                log.warning(f"TG {tg_id}: page appears to require login — re-authenticating")
+                broadcastify_login()
+            else:
+                log.debug(f"TG {tg_id}: no calls found in page (may be quiet)")
             return results
-        elif r.status_code in (401, 403):
-            log.warning(f"TG {tg_id}: auth error {r.status_code} — re-logging in")
+
+        elif r.status_code in (401, 403) or "login" in r.url:
+            log.warning(f"TG {tg_id}: auth required ({r.status_code}) — re-logging in")
             broadcastify_login()
     except Exception as e:
         log.error(f"fetch_calls TG {tg_id}: {e}")
     return []
+
+def _normalize_call(c: dict, tg_id: int, system_id: int) -> dict:
+    """Normalize a raw call dict from any source into a standard format."""
+    attrs = c.get("attrs", c)
+    fn = attrs.get("filename", attrs.get("fn", ""))
+    h = attrs.get("hash", "")
+    enc = attrs.get("enc", "mp3")
+    if h and fn:
+        audio_url = f"https://calls.broadcastify.com/{h}/{system_id}/{fn}.{enc}"
+    elif fn:
+        audio_url = f"https://calls.broadcastify.com/{system_id}/{fn}.{enc}"
+    else:
+        audio_url = ""
+    return {
+        "tg": int(attrs.get("tg", tg_id)),
+        "ts": attrs.get("ts", attrs.get("start_time", 0)),
+        "len": float(attrs.get("len", attrs.get("duration", 0))),
+        "filename": fn,
+        "enc": enc,
+        "hash": h,
+        "audio_url": audio_url,
+        "transcription": attrs.get("transcription", attrs.get("transcript", "")),
+    }
 
 # ── Build a call event dict ────────────────────────────────────────────────
 def make_event(call: dict, tg_id: int) -> dict:
