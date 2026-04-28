@@ -73,7 +73,7 @@ talkgroups:
       type: "Fire-Tac"
 
 filtering:
-  min_duration_seconds: 10
+  min_duration_seconds: 25
   poll_interval_seconds: 30
   lookback_minutes: 5
 
