@@ -193,12 +193,16 @@ def fetch_all_calls() -> list[dict]:
         "Origin": "https://www.broadcastify.com",
     }
 
+    # sessionKey is required by Broadcastify — set via BCFY_SESSION_KEY env var
+    session_key = os.environ.get("BCFY_SESSION_KEY", config.get("broadcastify", {}).get("session_key", ""))
+
     payload = {
         "playlist_uuid": PLAYLIST_UUID,
         "pos": _playlist_pos,
         "doInit": 1 if _playlist_pos == 0 else 0,
         "sid": 0,
         "systemId": 0,
+        "sessionKey": session_key,
     }
 
     try:
